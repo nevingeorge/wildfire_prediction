@@ -90,7 +90,7 @@ class FireSegNet(nn.Module):
 # === Train Function ===
 def train():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_save_path = f"fire_segnet_best_{timestamp}.pth"
+    model_save_path = f"models/fire_segnet_best_{timestamp}.pth"
     print(f"Model will be saved to: {model_save_path}")
 
     train_paths = sorted(glob("archive/next_day_wildfire_spread_train_*.tfrecord"))
