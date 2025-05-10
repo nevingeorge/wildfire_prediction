@@ -1,0 +1,1 @@
+Kaggle dataset: https://www.kaggle.com/datasets/fantineh/next-day-wildfire-spread/data?select=next_day_wildfire_spread_train_04.tfrecord
