@@ -1,0 +1,16 @@
+name: wildfire
+channels:
+  - defaults
+  - conda-forge
+  - pytorch
+
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - matplotlib
+  - pillow
+  - pytorch
+  - torchvision
+  - pip:
+      - tfrecord
