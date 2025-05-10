@@ -2,4 +2,9 @@ Kaggle dataset: https://www.kaggle.com/datasets/fantineh/next-day-wildfire-sprea
 
 Paper: https://arxiv.org/pdf/2112.02447
 
-Example use case: python wildfire.py test --model_path models/fire_segnet_best.pth
+How to use: 
+
+```
+python wildfire.py train
+python wildfire.py test --model_path models/fire_segnet_best.pth
+```
