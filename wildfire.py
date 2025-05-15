@@ -26,17 +26,18 @@ EXAMPLES_BEFORE_PRINT = 100
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# display one sample
-def display_tfrecord(tfrecord_path):
-    for record in tfrecord_loader(tfrecord_path, index_path=None):
+# display n sample
+def display_tfrecord(tfrecord_path, n=1):
+    loader = tfrecord_loader(tfrecord_path, index_path=None)
+    for i, record in enumerate(itertools.islice(loader, n), 1):
         print("Keys in TFRecord:", list(record.keys()))
         
         num_keys = len(record)
-        cols = 4
-        rows = int(np.ceil(num_keys / cols))
-        fig, axes = plt.subplots(rows, cols, figsize=(15, 3 * rows))
+        rows = 1
+        cols = int(np.ceil(num_keys / rows))
+        fig, axes = plt.subplots(rows, cols, figsize=(15, 3))
 
-        for ax, (key, value) in zip(axes.flat, record.items()):
+        for ax, (key, value) in zip(axes.flat, sorted(record.items())):
             try:
                 arr = np.array(value, dtype=np.float32).reshape(IMG_SHAPE)
                 ax.imshow(arr, cmap='viridis')
@@ -53,7 +54,6 @@ def display_tfrecord(tfrecord_path):
 
         plt.tight_layout()
         plt.show()
-        break  # Only process the first record
 
 # === Dataset ===
 class WildfireTFRecordDataset(IterableDataset):
