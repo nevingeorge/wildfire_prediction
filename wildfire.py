@@ -19,7 +19,7 @@ input_keys = ['erc', 'tmmx', 'elevation', 'PrevFireMask', 'th', 'population',
 target_key = 'FireMask'
 
 # Training parameters
-NUM_EPOCHS = 15
+NUM_EPOCHS = 30
 NUM_TRAINING_EXAMPLES = 2000
 NUM_VALIDATION_EXAMPLES = 500
 EXAMPLES_BEFORE_PRINT = 100
@@ -180,7 +180,7 @@ def train():
         model.train()
         train_loss = 0.0
 
-        for batch_idx, (x, y) in enumerate(itertools.islice(train_loader, NUM_TRAINING_EXAMPLES)):
+        for idx, (x, y) in enumerate(itertools.islice(train_loader, NUM_TRAINING_EXAMPLES)):
             x, y = x.to(DEVICE), y.to(DEVICE)
             logits = model(x)
             loss = criterion(logits, y)
@@ -191,21 +191,25 @@ def train():
 
             train_loss += loss.item()
 
-            if batch_idx % EXAMPLES_BEFORE_PRINT == 0:
-                print(f"[{batch_idx}/{NUM_TRAINING_EXAMPLES}] Train Loss: {loss.item():.4f}")
+            if idx % EXAMPLES_BEFORE_PRINT == 0:
+                avg_loss = train_loss / (idx + 1)
+                print(f"[{idx}/{NUM_TRAINING_EXAMPLES}] Train Loss: {avg_loss:.4f}")
+        train_loss /= NUM_TRAINING_EXAMPLES
         
         # === Validation ===
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for batch_idx, (x, y) in enumerate(itertools.islice(val_loader, NUM_VALIDATION_EXAMPLES)):
+            for idx, (x, y) in enumerate(itertools.islice(val_loader, NUM_VALIDATION_EXAMPLES)):
                 x, y = x.to(DEVICE), y.to(DEVICE)
                 logits = model(x)
                 loss = criterion(logits, y)
                 val_loss += loss.item()
 
-                if batch_idx % EXAMPLES_BEFORE_PRINT == 0:
-                    print(f"[{batch_idx}/{NUM_VALIDATION_EXAMPLES}] Val Loss: {loss.item():.4f}")
+                if idx % EXAMPLES_BEFORE_PRINT == 0:
+                    avg_loss = val_loss / (idx + 1)
+                    print(f"[{idx}/{NUM_VALIDATION_EXAMPLES}] Val Loss: {avg_loss:.4f}")
+        val_loss /= NUM_VALIDATION_EXAMPLES
         
         print(f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
 
