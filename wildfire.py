@@ -173,7 +173,7 @@ def train():
 
     num_training_batches = min(MAX_TRAINING_BATCHES, num_training_batches)
     num_validation_batches = min(MAX_VALIDATION_BATCHES, num_validation_batches)
-    print(f"Training on {num_training_batches} batches, validation on {num_validation_batches} batches")
+    print(f"Training on {num_training_batches} batches, validating on {num_validation_batches} batches, batch size {BATCH_SIZE}")
 
     model = UNet().to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
@@ -268,11 +268,15 @@ def test(model_load_path):
     test_paths = sorted(glob("archive/next_day_wildfire_spread_test_*.tfrecord"))
     test_loader = DataLoader(WildfireTFRecordDataset(test_paths), batch_size=BATCH_SIZE)
 
+    num_testing_batches = 0
+    for batch in test_loader:
+         num_testing_batches += 1
+
     model = UNet().to(DEVICE)
     model.load_state_dict(torch.load(model_load_path, map_location=DEVICE))
     model.eval()
 
-    print(f"Loaded model from {model_load_path}. Beginning testing...")
+    print(f"Loaded model from {model_load_path}. Beginning testing on {num_testing_batches} batches...")
 
     criterion = nn.CrossEntropyLoss(ignore_index=255)
     total_loss = 0.0
