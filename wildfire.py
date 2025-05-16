@@ -20,9 +20,10 @@ target_key = 'FireMask'
 
 # Training parameters
 NUM_EPOCHS = 30
-NUM_TRAINING_EXAMPLES = 2000
-NUM_VALIDATION_EXAMPLES = 500
-EXAMPLES_BEFORE_PRINT = 100
+BATCH_SIZE = 16
+MAX_TRAINING_BATCHES = 100000
+MAX_VALIDATION_BATCHES = 100000
+BATCHES_BEFORE_PRINT = 100
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -162,8 +163,18 @@ def train():
     # train_paths = sorted(glob("archive/next_day_wildfire_spread_train_00.tfrecord"))
     # val_paths = sorted(glob("archive/next_day_wildfire_spread_eval_00.tfrecord"))
 
-    train_loader = DataLoader(WildfireTFRecordDataset(train_paths), batch_size=8)
-    val_loader = DataLoader(WildfireTFRecordDataset(val_paths), batch_size=8)
+    train_loader = DataLoader(WildfireTFRecordDataset(train_paths), batch_size=BATCH_SIZE)
+    val_loader = DataLoader(WildfireTFRecordDataset(val_paths), batch_size=BATCH_SIZE)
+
+    num_training_batches, num_validation_batches = 0, 0
+    for batch in train_loader:
+         num_training_batches += 1
+    for batch in val_loader:
+         num_validation_batches += 1
+
+    num_training_batches = min(MAX_TRAINING_BATCHES, num_training_batches)
+    num_validation_batches = min(MAX_VALIDATION_BATCHES, num_validation_batches)
+    print(f"Training on {num_training_batches} batches, validation on {num_validation_batches} batches")
 
     model = UNet().to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
@@ -178,9 +189,9 @@ def train():
     for epoch in range(1, NUM_EPOCHS + 1):
         # === Train ===
         model.train()
-        train_loss = 0.0
+        train_loss, count = 0.0, 0.0
 
-        for idx, (x, y) in enumerate(itertools.islice(train_loader, NUM_TRAINING_EXAMPLES)):
+        for batch_idx, (x, y) in enumerate(itertools.islice(train_loader, num_training_batches)):
             x, y = x.to(DEVICE), y.to(DEVICE)
             logits = model(x)
             loss = criterion(logits, y)
@@ -190,26 +201,28 @@ def train():
             optimizer.step()
 
             train_loss += loss.item()
+            count += 1.0
 
-            if idx % EXAMPLES_BEFORE_PRINT == 0:
-                avg_loss = train_loss / (idx + 1)
-                print(f"[{idx}/{NUM_TRAINING_EXAMPLES}] Train Loss: {avg_loss:.4f}")
-        train_loss /= NUM_TRAINING_EXAMPLES
+            if batch_idx % BATCHES_BEFORE_PRINT == 0:
+                avg_loss = train_loss / count
+                print(f"[Batch {batch_idx}/{num_training_batches}] Train Loss: {avg_loss:.4f}")
+        train_loss /= count
         
         # === Validation ===
         model.eval()
-        val_loss = 0.0
+        val_loss, count = 0.0, 0.0
         with torch.no_grad():
-            for idx, (x, y) in enumerate(itertools.islice(val_loader, NUM_VALIDATION_EXAMPLES)):
+            for batch_idx, (x, y) in enumerate(itertools.islice(val_loader, num_validation_batches)):
                 x, y = x.to(DEVICE), y.to(DEVICE)
                 logits = model(x)
                 loss = criterion(logits, y)
                 val_loss += loss.item()
+                count += 1.0
 
-                if idx % EXAMPLES_BEFORE_PRINT == 0:
-                    avg_loss = val_loss / (idx + 1)
-                    print(f"[{idx}/{NUM_VALIDATION_EXAMPLES}] Val Loss: {avg_loss:.4f}")
-        val_loss /= NUM_VALIDATION_EXAMPLES
+                if batch_idx % BATCHES_BEFORE_PRINT == 0:
+                    avg_loss = val_loss / count
+                    print(f"[{batch_idx}/{num_validation_batches}] Val Loss: {avg_loss:.4f}")
+        val_loss /= count
         
         print(f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
 
@@ -254,7 +267,7 @@ def train():
 
 def test(model_load_path):
     test_paths = sorted(glob("archive/next_day_wildfire_spread_test_*.tfrecord"))
-    test_loader = DataLoader(WildfireTFRecordDataset(test_paths), batch_size=8)
+    test_loader = DataLoader(WildfireTFRecordDataset(test_paths), batch_size=BATCH_SIZE)
 
     model = UNet().to(DEVICE)
     model.load_state_dict(torch.load(model_load_path, map_location=DEVICE))
