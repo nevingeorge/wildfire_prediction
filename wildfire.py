@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset
 from tfrecord.reader import tfrecord_loader
 import numpy as np
@@ -11,6 +12,7 @@ from datetime import datetime
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import csv
 import os
+from sklearn.metrics import precision_score, recall_score, average_precision_score, precision_recall_curve, f1_score
 
 IMG_SHAPE = (64,64)
 NUM_CLASSES = 2  # fire vs no-fire (uncertain is ignored)
@@ -160,9 +162,6 @@ def train():
     train_paths = sorted(glob("archive/next_day_wildfire_spread_train_*.tfrecord"))
     val_paths = sorted(glob("archive/next_day_wildfire_spread_eval_*.tfrecord"))
 
-    # train_paths = sorted(glob("archive/next_day_wildfire_spread_train_00.tfrecord"))
-    # val_paths = sorted(glob("archive/next_day_wildfire_spread_eval_00.tfrecord"))
-
     train_loader = DataLoader(WildfireTFRecordDataset(train_paths), batch_size=BATCH_SIZE)
     val_loader = DataLoader(WildfireTFRecordDataset(val_paths), batch_size=BATCH_SIZE)
 
@@ -273,17 +272,82 @@ def test(model_load_path):
     model.load_state_dict(torch.load(model_load_path, map_location=DEVICE))
     model.eval()
 
+    print(f"Loaded model from {model_load_path}. Beginning testing...")
+
     criterion = nn.CrossEntropyLoss(ignore_index=255)
     total_loss = 0.0
+    batch_count = 0
+
+    all_preds = []
+    all_labels = []
 
     with torch.no_grad():
         for x, y in test_loader:
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            logits = model(x)
+            x, y = x.to(DEVICE), y.to(DEVICE)  # y: (B, H, W)
+            logits = model(x)  # (B, C, H, W)
             loss = criterion(logits, y)
             total_loss += loss.item()
+            batch_count += 1
 
-    print(f"Test Loss: {total_loss:.4f}")
+            # Get probabilities for class 1 (fire)
+            probs = torch.softmax(logits, dim=1)[:, 1, :, :]  # (B, H, W)
+
+            # Flatten and mask out uncertain labels
+            y_flat = y.reshape(-1)
+            p_flat = probs.reshape(-1)
+
+            mask = y_flat != 255
+            y_valid = y_flat[mask].cpu().numpy()
+            p_valid = p_flat[mask].cpu().numpy()
+
+            all_labels.extend(y_valid)
+            all_preds.extend(p_valid)
+
+    # Convert to NumPy arrays
+    all_labels = np.array(all_labels)
+    all_preds = np.array(all_preds)
+    threshold = 0.2
+    pred_binary = (all_preds >= threshold).astype(int)
+
+    test_loss_avg = total_loss / batch_count
+    auc_pr = average_precision_score(all_labels, all_preds)
+    precision = precision_score(all_labels, pred_binary)
+    recall = recall_score(all_labels, pred_binary)
+    f1_score = 2 * (precision * recall) / (precision + recall + 1e-8)
+
+    # print("Max fire prob:", np.max(all_preds))
+    # print("Mean fire prob:", np.mean(all_preds))
+
+    # unique, counts = np.unique(all_labels, return_counts=True)
+    # print(dict(zip(unique, counts)))
+
+    # precision, recall, thresholds = precision_recall_curve(all_labels, all_preds)
+    # f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
+
+    # best_idx = np.argmax(f1_scores)
+    # best_threshold = thresholds[best_idx]
+    # best_f1 = f1_scores[best_idx]
+
+    print(f"\nTest Loss: {test_loss_avg:.4f}")
+    print(f"AUC (PR):   {auc_pr:.4f}")
+    # print(f"Best threshold: {best_threshold:.4f}")
+    # print(f"F1 score: {best_f1:.4f}")
+    # print(f"Precision: {precision[best_idx]:.4f}")
+    # print(f"Recall: {recall[best_idx]:.4f}")
+    print(f"F1 score: {f1_score:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+
+    model_name = model_load_path.split("/")[-2]
+    os.makedirs("results", exist_ok=True)
+    with open(f"results/test_results_{model_name}.txt", "w") as f:
+        f.write(f"Test Loss: {test_loss_avg:.4f}\n")
+        f.write(f"AUC (PR):   {auc_pr:.4f}\n")
+        f.write(f"F1 score: {f1_score:.4f}\n")
+        f.write(f"Precision: {precision:.4f}\n")
+        f.write(f"Recall:    {recall:.4f}\n")
+
+    print(f"Test results saved to results/test_results_{model_name}.txt")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or test wildfire segmentation model.")
