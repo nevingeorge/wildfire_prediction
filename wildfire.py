@@ -13,6 +13,8 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import csv
 import os
 from sklearn.metrics import precision_score, recall_score, average_precision_score, precision_recall_curve, f1_score
+import seaborn as sns
+import pandas as pd
 
 IMG_SHAPE = (64,64)
 NUM_CLASSES = 2  # fire vs no-fire (uncertain is ignored)
@@ -20,11 +22,10 @@ input_keys = ['erc', 'tmmx', 'elevation', 'PrevFireMask', 'th', 'population',
               'pdsi', 'vs', 'NDVI', 'sph', 'pr', 'tmmn']
 target_key = 'FireMask'
 
-# Training parameters
-NUM_EPOCHS = 30
+# If the batch size changes from 16, update these values accordingly
+AVAILABLE_TRAINING_BATCHES = 937
+AVAILABLE_VAL_BATCHES = 118
 BATCH_SIZE = 16
-MAX_TRAINING_BATCHES = 100000
-MAX_VALIDATION_BATCHES = 100000
 BATCHES_BEFORE_PRINT = 100
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -146,46 +147,49 @@ class UNet(nn.Module):
 
         return self.classifier(d1)
 
-# === Train Function ===
-def train():
-    timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-
-    directory = f"models/model_{timestamp}"
-    os.makedirs(directory, exist_ok=True)
-    model_save_path = directory + "/UNet.pth"
-    training_log_path = directory + "/training_log.csv"
-    training_loss_plot_path = directory + "/training_loss_plot.png"
-    print(f"Model will be saved to: {model_save_path}")
-
-    log_rows = [("epoch", "train_loss", "val_loss", "lr")]
-
-    train_paths = sorted(glob("archive/next_day_wildfire_spread_train_*.tfrecord"))
-    val_paths = sorted(glob("archive/next_day_wildfire_spread_eval_*.tfrecord"))
+def get_data(train_path, val_path, max_train_batches, max_val_batches):
+    train_paths = sorted(glob(train_path))
+    val_paths = sorted(glob(val_path))
 
     train_loader = DataLoader(WildfireTFRecordDataset(train_paths), batch_size=BATCH_SIZE)
     val_loader = DataLoader(WildfireTFRecordDataset(val_paths), batch_size=BATCH_SIZE)
 
-    num_training_batches, num_validation_batches = 0, 0
-    for batch in train_loader:
-         num_training_batches += 1
-    for batch in val_loader:
-         num_validation_batches += 1
+    num_training_batches = min(max_train_batches, AVAILABLE_TRAINING_BATCHES)
+    num_validation_batches = min(max_val_batches, AVAILABLE_VAL_BATCHES)
 
-    num_training_batches = min(MAX_TRAINING_BATCHES, num_training_batches)
-    num_validation_batches = min(MAX_VALIDATION_BATCHES, num_validation_batches)
-    print(f"Training on {num_training_batches} batches, validating on {num_validation_batches} batches, batch size {BATCH_SIZE}")
+    return train_loader, val_loader, num_training_batches, num_validation_batches
+
+# === Train Function ===
+def train(train_loader, val_loader, num_training_batches, num_validation_batches, lr, weight_decay, num_epochs, save_results=True):
+    if save_results:
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+
+        directory = f"models/model_{timestamp}"
+        os.makedirs(directory, exist_ok=True)
+        model_save_path = directory + "/UNet.pth"
+        training_log_path = directory + "/training_log.csv"
+        training_loss_plot_path = directory + "/training_loss_plot.png"
+        print(f"Model will be saved to: {model_save_path}")
+
+        log_rows = [("epoch", "train_loss", "val_loss", "lr")]
 
     model = UNet().to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-    criterion = nn.CrossEntropyLoss(ignore_index=255)
+
+    # weighted cross entropy loss
+    class_counts = np.array([6643368, 84331])
+    class_weights = 1.0 / class_counts
+    class_weights = class_weights / class_weights.sum()  # normalize
+    weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=255)
 
     early_stop_patience = 5
     epochs_without_improvement = 0
 
     best_val_loss = float('inf')
 
-    for epoch in range(1, NUM_EPOCHS + 1):
+    for epoch in range(1, num_epochs + 1):
         # === Train ===
         model.train()
         train_loss, count = 0.0, 0.0
@@ -227,14 +231,18 @@ def train():
 
         scheduler.step(val_loss)
 
-        current_lr = optimizer.param_groups[0]["lr"]
-        log_rows.append((epoch, train_loss, val_loss, current_lr))
+        if save_results:
+            current_lr = optimizer.param_groups[0]["lr"]
+            log_rows.append((epoch, train_loss, val_loss, current_lr))
 
         # Save best model and track early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), model_save_path)
-            print(f"Saved new best model at epoch {epoch} with val loss {val_loss:.4f}")
+
+            if save_results:
+                torch.save(model.state_dict(), model_save_path)
+                print(f"Saved new best model at epoch {epoch} with val loss {val_loss:.4f}")
+
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -243,29 +251,83 @@ def train():
             print("Early stopping: no improvement in validation loss.")
             break
     
-    with open(training_log_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerows(log_rows)
-    print(f"Saved training log to {training_log_path}")
+    if save_results:
+        with open(training_log_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(log_rows)
+        print(f"Saved training log to {training_log_path}")
 
-    # Extract values
-    epochs = [row[0] for row in log_rows[1:]]
-    train_losses = [row[1] for row in log_rows[1:]]
-    val_losses = [row[2] for row in log_rows[1:]]
+        # Extract values
+        epochs = [row[0] for row in log_rows[1:]]
+        train_losses = [row[1] for row in log_rows[1:]]
+        val_losses = [row[2] for row in log_rows[1:]]
 
-    plt.plot(epochs, train_losses, label="Train Loss")
-    plt.plot(epochs, val_losses, label="Val Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training Curve")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(training_loss_plot_path)
-    plt.show()
-    print(f"Saved loss plot to {training_loss_plot_path}")
+        plt.plot(epochs, train_losses, label="Train Loss")
+        plt.plot(epochs, val_losses, label="Val Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Training Curve")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(training_loss_plot_path)
+        plt.show()
+        print(f"Saved loss plot to {training_loss_plot_path}")
+    else:
+        return best_val_loss
+    
+    return None
 
-def test(model_load_path):
-    test_paths = sorted(glob("archive/next_day_wildfire_spread_test_*.tfrecord"))
+def grid_search(search_space, train_loader, val_loader, num_training_batches, num_validation_batches, num_epochs):
+    timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    best_val_loss = float("inf")
+    best_hparams = None
+    results = []
+
+    for lr in search_space["lr"]:
+        for wd in search_space["weight_decay"]:
+            print(f"\n--- Training with lr={lr}, weight_decay={wd} ---")
+            best_trial_val_loss = train(train_loader, val_loader, num_training_batches, num_validation_batches, lr, wd, num_epochs, save_results=False)
+            print(f"Final Val Loss for lr={lr}, wd={wd}: {best_trial_val_loss:.4f}")
+            results.append({"lr": lr, "weight_decay": wd, "val_loss": best_trial_val_loss})
+
+            if best_trial_val_loss < best_val_loss:
+                best_val_loss = best_trial_val_loss
+                best_hparams = {"lr": lr, "weight_decay": wd}
+    
+    print(f"Best hyperparameters: {best_hparams}")
+
+    save_results_path = f"grid_search/results_{timestamp}"
+    os.makedirs(save_results_path, exist_ok=True)
+
+    # === Save results to txt file ===
+    results_txt_path = os.path.join(save_results_path, "gridsearch_results.txt")
+    with open(results_txt_path, "w") as f:
+        f.write("Grid Search Results:\n")
+        for result in results:
+            f.write(f"lr: {result['lr']}, weight_decay: {result['weight_decay']}, val_loss: {result['val_loss']:.4f}\n")
+        f.write(f"\nBest Hyperparameters:\n{best_hparams}\n")
+        f.write(f"Best Validation Loss: {best_val_loss:.4f}\n")
+    print(f"Saved grid search results to {results_txt_path}")
+
+    # === Plot heatmap ===
+    results_df = pd.DataFrame(results)
+    heatmap_data = results_df.pivot(index="lr", columns="weight_decay", values="val_loss")
+
+    vmin = max(heatmap_data.min().min(), 0)
+    vmax = min(heatmap_data.max().max(), 1)
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(heatmap_data, annot=True, fmt=".4f", cmap="viridis_r", vmin=vmin, vmax=vmax)
+    plt.title("Grid Search Validation Loss")
+    plt.xlabel("Weight Decay")
+    plt.ylabel("Learning Rate")
+    plt.tight_layout()
+    heatmap_path = os.path.join(save_results_path, "gridsearch_heatmap.png")
+    plt.savefig(heatmap_path)
+    print(f"Saved heatmap to {heatmap_path}")
+
+def test(test_path, model_load_path):
+    test_paths = sorted(glob(test_path))
     test_loader = DataLoader(WildfireTFRecordDataset(test_paths), batch_size=BATCH_SIZE)
 
     num_testing_batches = 0
@@ -273,7 +335,7 @@ def test(model_load_path):
          num_testing_batches += 1
 
     model = UNet().to(DEVICE)
-    model.load_state_dict(torch.load(model_load_path, map_location=DEVICE))
+    model.load_state_dict(torch.load(model_load_path + "/UNet.pth", map_location=DEVICE))
     model.eval()
 
     print(f"Loaded model from {model_load_path}. Beginning testing on {num_testing_batches} batches...")
@@ -342,26 +404,47 @@ def test(model_load_path):
     print(f"Precision: {precision:.4f}")
     print(f"Recall: {recall:.4f}")
 
-    model_name = model_load_path.split("/")[-2]
-    os.makedirs("results", exist_ok=True)
-    with open(f"results/test_results_{model_name}.txt", "w") as f:
+    save_results_path = f"{model_load_path}/test_results.txt"
+    with open(save_results_path, "w") as f:
         f.write(f"Test Loss: {test_loss_avg:.4f}\n")
         f.write(f"AUC (PR):   {auc_pr:.4f}\n")
         f.write(f"F1 score: {f1_score:.4f}\n")
         f.write(f"Precision: {precision:.4f}\n")
         f.write(f"Recall:    {recall:.4f}\n")
 
-    print(f"Test results saved to results/test_results_{model_name}.txt")
+    print(f"Test results saved to {save_results_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or test wildfire segmentation model.")
-    parser.add_argument("mode", choices=["train", "test"], help="Mode: train or test")
+    parser.add_argument("mode", choices=["train", "test", "search"], help="Mode: train, test, or search")
     parser.add_argument("--model_path", type=str, required=False, help="Path to load model weights")
+    parser.add_argument("--lr", type=float, required=False, help="Learning rate")
+    parser.add_argument("--wd", type=float, required=False, help="Weight decay")
+    parser.add_argument("--epochs", type=int, required=False, help="Number of epochs", default=30)
+    parser.add_argument("--max_train_batches", type=int, required=False, help="Maximum number of training batches", default=100000)
+    parser.add_argument("--max_val_batches", type=int, required=False, help="Maximum number of validation batches", default=100000)
     args = parser.parse_args()
 
     print(f"Using device: {DEVICE}")
 
-    if args.mode == "train":
-        train()
+    if args.mode == "train" or args.mode == "search":
+        train_path = "archive/next_day_wildfire_spread_train_*.tfrecord"
+        val_path = "archive/next_day_wildfire_spread_eval_*.tfrecord"
+        train_loader, val_loader, num_training_batches, num_validation_batches = get_data(train_path, val_path, args.max_train_batches, args.max_val_batches)
+        print(f"Training on {num_training_batches} batches, validating on {num_validation_batches} batches, batch size {BATCH_SIZE}")
+
+        if args.mode == "train":
+            if args.lr is None or args.wd is None:
+                parser.error("--lr and --wd are required when mode is 'train'")
+
+            train(train_loader, val_loader, num_training_batches, num_validation_batches, args.lr, args.wd, args.epochs)
+        elif args.mode == "search":
+            search_space = {
+                "lr": [1e-4, 1e-3, 1e-2],
+                "weight_decay": [1e-5, 1e-3, 1e-2]
+            }
+
+            grid_search(search_space, train_loader, val_loader, num_training_batches, num_validation_batches, args.epochs)
     elif args.mode == "test":
-        test(model_load_path=args.model_path)
+        test_path = "archive/next_day_wildfire_spread_test_*.tfrecord"
+        test(test_path, model_load_path=args.model_path)

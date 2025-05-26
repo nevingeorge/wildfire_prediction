@@ -13,5 +13,6 @@ dependencies:
   - pytorch
   - torchvision
   - scikit-learn
+  - seaborn
   - pip:
       - tfrecord
