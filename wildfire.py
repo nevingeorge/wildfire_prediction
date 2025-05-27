@@ -15,6 +15,7 @@ import os
 from sklearn.metrics import precision_score, recall_score, average_precision_score, precision_recall_curve, f1_score
 import seaborn as sns
 import pandas as pd
+from transformers import SegformerForSemanticSegmentation, SegformerConfig
 
 IMG_SHAPE = (64,64)
 NUM_CLASSES = 2  # fire vs no-fire (uncertain is ignored)
@@ -147,6 +148,54 @@ class UNet(nn.Module):
 
         return self.classifier(d1)
 
+class SegFormer(nn.Module):
+    def __init__(self, in_channels=12, num_classes=2, image_size=64):
+        super().__init__()
+
+        # MiT-B1 backbone
+        config = SegformerConfig(
+            num_labels=num_classes,
+            image_size=image_size,
+            hidden_sizes=[64, 128, 320, 512],
+            depths=[2, 2, 2, 2],
+            attention_heads=[1, 2, 5, 8],
+            decoder_hidden_size=256,
+            classifier_dropout_prob=0.1,
+            hidden_act="gelu",
+            initializer_range=0.02
+        )
+
+        # Create model from scratch (no pretraining)
+        self.model = SegformerForSemanticSegmentation(config)
+
+        # Replace first Conv2D to accept in_channels (e.g., 12 instead of 3)
+        self.model.segformer.encoder.patch_embeddings[0].proj = nn.Conv2d(
+            in_channels,
+            config.hidden_sizes[0],
+            kernel_size=7,
+            stride=4,
+            padding=3
+        )
+
+        # Init input layer
+        nn.init.kaiming_normal_(self.model.segformer.encoder.patch_embeddings[0].proj.weight, nonlinearity='relu')
+
+        self.output_size = (image_size, image_size)
+
+    def forward(self, x):
+        logits = self.model(pixel_values=x).logits  # shape: (B, C, H_out, W_out)
+
+        # Upsample to match label resolution (64x64)
+        if logits.shape[-2:] != self.output_size:
+            logits = nn.functional.interpolate(
+                logits,
+                size=self.output_size,
+                mode="bilinear",
+                align_corners=False
+            )
+
+        return logits  # (B, num_classes, 64, 64)
+    
 def get_data(train_path, val_path, max_train_batches, max_val_batches):
     train_paths = sorted(glob(train_path))
     val_paths = sorted(glob(val_path))
@@ -159,21 +208,29 @@ def get_data(train_path, val_path, max_train_batches, max_val_batches):
 
     return train_loader, val_loader, num_training_batches, num_validation_batches
 
+def get_model(model_type):
+    if model_type == "UNet":
+        return UNet().to(DEVICE)
+    elif model_type == "SegFormer":
+        return SegFormer().to(DEVICE)
+    else:
+        raise ValueError("Invalid model type. Choose 'UNet' or 'SegFormer'.")
+
 # === Train Function ===
-def train(train_loader, val_loader, num_training_batches, num_validation_batches, lr, weight_decay, num_epochs, save_results=True):
+def train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, weight_decay, num_epochs, save_results=True):
     if save_results:
         timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 
         directory = f"models/model_{timestamp}"
         os.makedirs(directory, exist_ok=True)
-        model_save_path = directory + "/UNet.pth"
-        training_log_path = directory + "/training_log.csv"
-        training_loss_plot_path = directory + "/training_loss_plot.png"
+        model_save_path = f"{directory}/{model_type}.pth"
+        training_log_path = f"{directory}/training_log.csv"
+        training_loss_plot_path = f"{directory}/training_loss_plot.png"
         print(f"Model will be saved to: {model_save_path}")
 
         log_rows = [("epoch", "train_loss", "val_loss", "lr")]
 
-    model = UNet().to(DEVICE)
+    model = get_model(model_type)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
 
@@ -270,14 +327,13 @@ def train(train_loader, val_loader, num_training_batches, num_validation_batches
         plt.legend()
         plt.grid(True)
         plt.savefig(training_loss_plot_path)
-        plt.show()
         print(f"Saved loss plot to {training_loss_plot_path}")
     else:
         return best_val_loss
     
     return None
 
-def grid_search(search_space, train_loader, val_loader, num_training_batches, num_validation_batches, num_epochs):
+def grid_search(model_type, search_space, train_loader, val_loader, num_training_batches, num_validation_batches, num_epochs):
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     best_val_loss = float("inf")
     best_hparams = None
@@ -286,7 +342,7 @@ def grid_search(search_space, train_loader, val_loader, num_training_batches, nu
     for lr in search_space["lr"]:
         for wd in search_space["weight_decay"]:
             print(f"\n--- Training with lr={lr}, weight_decay={wd} ---")
-            best_trial_val_loss = train(train_loader, val_loader, num_training_batches, num_validation_batches, lr, wd, num_epochs, save_results=False)
+            best_trial_val_loss = train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, wd, num_epochs, save_results=False)
             print(f"Final Val Loss for lr={lr}, wd={wd}: {best_trial_val_loss:.4f}")
             results.append({"lr": lr, "weight_decay": wd, "val_loss": best_trial_val_loss})
 
@@ -326,7 +382,7 @@ def grid_search(search_space, train_loader, val_loader, num_training_batches, nu
     plt.savefig(heatmap_path)
     print(f"Saved heatmap to {heatmap_path}")
 
-def test(test_path, model_load_path):
+def test(model_type, test_path, model_load_path):
     test_paths = sorted(glob(test_path))
     test_loader = DataLoader(WildfireTFRecordDataset(test_paths), batch_size=BATCH_SIZE)
 
@@ -334,8 +390,8 @@ def test(test_path, model_load_path):
     for batch in test_loader:
          num_testing_batches += 1
 
-    model = UNet().to(DEVICE)
-    model.load_state_dict(torch.load(model_load_path + "/UNet.pth", map_location=DEVICE))
+    model = get_model(model_type)
+    model.load_state_dict(torch.load(f"{model_load_path}/{model_type}.pth", map_location=DEVICE))
     model.eval()
 
     print(f"Loaded model from {model_load_path}. Beginning testing on {num_testing_batches} batches...")
@@ -417,9 +473,10 @@ def test(test_path, model_load_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or test wildfire segmentation model.")
     parser.add_argument("mode", choices=["train", "test", "search"], help="Mode: train, test, or search")
+    parser.add_argument("--model_type", type=str, required=False, help="UNet or SegFormer", default="UNet")
     parser.add_argument("--model_path", type=str, required=False, help="Path to load model weights")
-    parser.add_argument("--lr", type=float, required=False, help="Learning rate")
-    parser.add_argument("--wd", type=float, required=False, help="Weight decay")
+    parser.add_argument("--lr", type=float, required=False, help="Learning rate", default=1e-3)
+    parser.add_argument("--wd", type=float, required=False, help="Weight decay", default=1e-2)
     parser.add_argument("--epochs", type=int, required=False, help="Number of epochs", default=30)
     parser.add_argument("--max_train_batches", type=int, required=False, help="Maximum number of training batches", default=100000)
     parser.add_argument("--max_val_batches", type=int, required=False, help="Maximum number of validation batches", default=100000)
@@ -433,18 +490,22 @@ if __name__ == "__main__":
         train_loader, val_loader, num_training_batches, num_validation_batches = get_data(train_path, val_path, args.max_train_batches, args.max_val_batches)
         print(f"Training on {num_training_batches} batches, validating on {num_validation_batches} batches, batch size {BATCH_SIZE}")
 
+        print(f"Using model: {args.model_type}")
+        print(f"Model will be trained for {args.epochs} epochs with learning rate {args.lr} and weight decay {args.wd}")
+        print("\n--------------------------------------------------------------------\n")
+
         if args.mode == "train":
             if args.lr is None or args.wd is None:
                 parser.error("--lr and --wd are required when mode is 'train'")
 
-            train(train_loader, val_loader, num_training_batches, num_validation_batches, args.lr, args.wd, args.epochs)
+            train(args.model_type, train_loader, val_loader, num_training_batches, num_validation_batches, args.lr, args.wd, args.epochs)
         elif args.mode == "search":
             search_space = {
                 "lr": [1e-4, 1e-3, 1e-2],
                 "weight_decay": [1e-5, 1e-3, 1e-2]
             }
 
-            grid_search(search_space, train_loader, val_loader, num_training_batches, num_validation_batches, args.epochs)
+            grid_search(args.model_type, search_space, train_loader, val_loader, num_training_batches, num_validation_batches, args.epochs)
     elif args.mode == "test":
         test_path = "archive/next_day_wildfire_spread_test_*.tfrecord"
-        test(test_path, model_load_path=args.model_path)
+        test(args.model_type, test_path, model_load_path=args.model_path)
