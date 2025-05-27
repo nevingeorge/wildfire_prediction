@@ -352,7 +352,7 @@ def grid_search(model_type, search_space, train_loader, val_loader, num_training
     
     print(f"Best hyperparameters: {best_hparams}")
 
-    save_results_path = f"grid_search/results_{timestamp}"
+    save_results_path = f"grid_search/results_{model_type}_{timestamp}"
     os.makedirs(save_results_path, exist_ok=True)
 
     # === Save results to txt file ===
