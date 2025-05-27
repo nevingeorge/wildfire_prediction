@@ -428,7 +428,7 @@ def test(model_type, test_path, model_load_path):
     # Convert to NumPy arrays
     all_labels = np.array(all_labels)
     all_preds = np.array(all_preds)
-    threshold = 0.2
+    threshold = 0.5
     pred_binary = (all_preds >= threshold).astype(int)
 
     test_loss_avg = total_loss / batch_count
@@ -490,14 +490,12 @@ if __name__ == "__main__":
         train_loader, val_loader, num_training_batches, num_validation_batches = get_data(train_path, val_path, args.max_train_batches, args.max_val_batches)
         print(f"Training on {num_training_batches} batches, validating on {num_validation_batches} batches, batch size {BATCH_SIZE}")
 
-        print(f"Using model: {args.model_type}")
-        print(f"Model will be trained for {args.epochs} epochs with learning rate {args.lr} and weight decay {args.wd}")
-        print("\n--------------------------------------------------------------------\n")
-
         if args.mode == "train":
             if args.lr is None or args.wd is None:
                 parser.error("--lr and --wd are required when mode is 'train'")
-
+            
+            print(f"{args.model_type} model will be trained for {args.epochs} epochs with learning rate {args.lr} and weight decay {args.wd}")
+            print("\n--------------------------------------------------------------------\n")
             train(args.model_type, train_loader, val_loader, num_training_batches, num_validation_batches, args.lr, args.wd, args.epochs)
         elif args.mode == "search":
             search_space = {
@@ -505,6 +503,7 @@ if __name__ == "__main__":
                 "weight_decay": [1e-5, 1e-3, 1e-2]
             }
 
+            print(f"Starting grid search with {args.model_type} model and hyperparameter space: {search_space}")
             grid_search(args.model_type, search_space, train_loader, val_loader, num_training_batches, num_validation_batches, args.epochs)
     elif args.mode == "test":
         test_path = "archive/next_day_wildfire_spread_test_*.tfrecord"
