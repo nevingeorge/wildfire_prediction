@@ -596,6 +596,7 @@ if __name__ == "__main__":
             print(f"Starting grid search with {args.model_type} model, {args.epochs} epochs, loss function weights {weights}, and hyperparameter space: {search_space}")
             grid_search(args.model_type, search_space, train_loader, val_loader, num_training_batches, num_validation_batches, args.epochs, weights)
         elif args.mode == "loss":
+            print(f"Starting loss function search with {args.model_type} model, {args.epochs} epochs, learning rate {args.lr}, and weight decay {args.wd}")
             loss_function_search(args.model_type, train_loader, val_loader, num_training_batches, num_validation_batches, args.epochs, args.lr, args.wd)
             
     elif args.mode == "test":
