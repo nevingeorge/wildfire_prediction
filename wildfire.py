@@ -570,7 +570,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, required=False, help="Learning rate", default=1e-3)
     parser.add_argument("--wd", type=float, required=False, help="Weight decay", default=1e-2)
     parser.add_argument("--epochs", type=int, required=False, help="Number of epochs", default=30)
-    parser.add_argument("--weights", type=int, required=False, help="Weight option: 0 (inverse class counts), 1 (0.1, 0.9), 1 (0.25, 0.75), or 3 (0.5, 0.5)", default=1)
+    parser.add_argument("--weights", type=int, required=False, help="Weight option: 0 (inverse class counts), 1 (0.1, 0.9), 2 (0.25, 0.75), or 3 (0.5, 0.5)", default=3)
     parser.add_argument("--max_train_batches", type=int, required=False, help="Maximum number of training batches", default=100000)
     parser.add_argument("--max_val_batches", type=int, required=False, help="Maximum number of validation batches", default=100000)
     args = parser.parse_args()
