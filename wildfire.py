@@ -27,9 +27,20 @@ target_key = 'FireMask'
 AVAILABLE_TRAINING_BATCHES = 937
 AVAILABLE_VAL_BATCHES = 118
 BATCH_SIZE = 16
-BATCHES_BEFORE_PRINT = 100
+BATCHES_BEFORE_VAL = 200
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+# weighted cross entropy loss
+class_counts = np.array([6643368, 84331])
+class_weights = 1.0 / class_counts
+class_weights = class_weights / class_weights.sum()  # normalize
+weights1 = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
+weights2 = torch.tensor(np.array([0.1, 0.9]), dtype=torch.float32, device=DEVICE)
+weights3 = torch.tensor(np.array([0.25, 0.75]), dtype=torch.float32, device=DEVICE)
+weights4 = torch.tensor(np.array([0.5, 0.5]), dtype=torch.float32, device=DEVICE)
+WEIGHT_OPTIONS = [weights1, weights2, weights3, weights4]
 
 # display n sample
 def display_tfrecord(tfrecord_path, n=1):
@@ -148,7 +159,55 @@ class UNet(nn.Module):
 
         return self.classifier(d1)
 
-class SegFormer(nn.Module):
+class SegFormerB0(nn.Module):
+    def __init__(self, in_channels=12, num_classes=2, image_size=64):
+        super().__init__()
+
+        # MiT-B0 backbone
+        config = SegformerConfig(
+            num_labels=num_classes,
+            image_size=image_size,
+            hidden_sizes=[32, 64, 160, 256],
+            depths=[2, 2, 2, 2],
+            attention_heads=[1, 2, 5, 8],
+            decoder_hidden_size=256,
+            classifier_dropout_prob=0.1,
+            hidden_act="gelu",
+            initializer_range=0.02
+        )
+
+        # Create model from scratch (no pretraining)
+        self.model = SegformerForSemanticSegmentation(config)
+
+        # Replace first Conv2D to accept in_channels (e.g., 12 instead of 3)
+        self.model.segformer.encoder.patch_embeddings[0].proj = nn.Conv2d(
+            in_channels,
+            config.hidden_sizes[0],
+            kernel_size=7,
+            stride=4,
+            padding=3
+        )
+
+        # Init input layer
+        nn.init.kaiming_normal_(self.model.segformer.encoder.patch_embeddings[0].proj.weight, nonlinearity='relu')
+
+        self.output_size = (image_size, image_size)
+
+    def forward(self, x):
+        logits = self.model(pixel_values=x).logits  # shape: (B, C, H_out, W_out)
+
+        # Upsample to match label resolution (64x64)
+        if logits.shape[-2:] != self.output_size:
+            logits = nn.functional.interpolate(
+                logits,
+                size=self.output_size,
+                mode="bilinear",
+                align_corners=False
+            )
+
+        return logits  # (B, num_classes, 64, 64)
+    
+class SegFormerB1(nn.Module):
     def __init__(self, in_channels=12, num_classes=2, image_size=64):
         super().__init__()
 
@@ -211,13 +270,40 @@ def get_data(train_path, val_path, max_train_batches, max_val_batches):
 def get_model(model_type):
     if model_type == "UNet":
         return UNet().to(DEVICE)
-    elif model_type == "SegFormer":
-        return SegFormer().to(DEVICE)
+    elif model_type == "SegFormerB0":
+        return SegFormerB0().to(DEVICE)
+    elif model_type == "SegFormerB1":
+        return SegFormerB1().to(DEVICE)
     else:
-        raise ValueError("Invalid model type. Choose 'UNet' or 'SegFormer'.")
+        raise ValueError("Invalid model type. Choose 'UNet', 'SegFormerB0', or 'SegFormerB1'.")
 
-# === Train Function ===
-def train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, weight_decay, num_epochs, save_results=True):
+def get_val_loss(model, criterion, val_loader, num_validation_batches):
+    model.eval()
+    val_loss, count = 0.0, 0.0
+    with torch.no_grad():
+        for batch_idx, (x, y) in enumerate(itertools.islice(val_loader, num_validation_batches)):
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            logits = model(x)
+            loss = criterion(logits, y)
+            val_loss += loss.item()
+            count += 1.0
+
+    val_loss /= count
+    return val_loss
+
+def log_results(model, criterion, val_loader, num_validation_batches, avg_train_loss, batch_idx, epoch, num_training_batches, optimizer, log_rows, save_results):
+    val_loss = get_val_loss(model, criterion, val_loader, num_validation_batches)
+    epoch_exact = round((epoch - 1) + (batch_idx + 1) / num_training_batches, 2)
+    print(f"[Epoch {epoch_exact}] Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}")
+
+    if save_results:
+        current_lr = optimizer.param_groups[0]["lr"]
+        log_rows.append((epoch_exact, avg_train_loss, val_loss, current_lr))
+    return val_loss
+
+def train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, weight_decay, num_epochs, weights, save_results=True):
+    log_rows = None
+
     if save_results:
         timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 
@@ -233,12 +319,6 @@ def train(model_type, train_loader, val_loader, num_training_batches, num_valida
     model = get_model(model_type)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-
-    # weighted cross entropy loss
-    class_counts = np.array([6643368, 84331])
-    class_weights = 1.0 / class_counts
-    class_weights = class_weights / class_weights.sum()  # normalize
-    weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
     criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=255)
 
     early_stop_patience = 5
@@ -263,34 +343,14 @@ def train(model_type, train_loader, val_loader, num_training_batches, num_valida
             train_loss += loss.item()
             count += 1.0
 
-            if batch_idx % BATCHES_BEFORE_PRINT == 0:
-                avg_loss = train_loss / count
-                print(f"[Batch {batch_idx}/{num_training_batches}] Train Loss: {avg_loss:.4f}")
-        train_loss /= count
-        
-        # === Validation ===
-        model.eval()
-        val_loss, count = 0.0, 0.0
-        with torch.no_grad():
-            for batch_idx, (x, y) in enumerate(itertools.islice(val_loader, num_validation_batches)):
-                x, y = x.to(DEVICE), y.to(DEVICE)
-                logits = model(x)
-                loss = criterion(logits, y)
-                val_loss += loss.item()
-                count += 1.0
+            if batch_idx % BATCHES_BEFORE_VAL == BATCHES_BEFORE_VAL - 1:
+                _ = log_results(model, criterion, val_loader, num_validation_batches, train_loss / count, 
+                            batch_idx, epoch, num_training_batches, optimizer, log_rows, save_results)
+                model.train()
 
-                if batch_idx % BATCHES_BEFORE_PRINT == 0:
-                    avg_loss = val_loss / count
-                    print(f"[{batch_idx}/{num_validation_batches}] Val Loss: {avg_loss:.4f}")
-        val_loss /= count
-        
-        print(f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-
+        val_loss = log_results(model, criterion, val_loader, num_validation_batches, train_loss / count, 
+                            batch_idx, epoch, num_training_batches, optimizer, log_rows, save_results)
         scheduler.step(val_loss)
-
-        if save_results:
-            current_lr = optimizer.param_groups[0]["lr"]
-            log_rows.append((epoch, train_loss, val_loss, current_lr))
 
         # Save best model and track early stopping
         if val_loss < best_val_loss:
@@ -333,7 +393,7 @@ def train(model_type, train_loader, val_loader, num_training_batches, num_valida
     
     return None
 
-def grid_search(model_type, search_space, train_loader, val_loader, num_training_batches, num_validation_batches, num_epochs):
+def grid_search(model_type, search_space, train_loader, val_loader, num_training_batches, num_validation_batches, num_epochs, weights):
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     best_val_loss = float("inf")
     best_hparams = None
@@ -342,7 +402,7 @@ def grid_search(model_type, search_space, train_loader, val_loader, num_training
     for lr in search_space["lr"]:
         for wd in search_space["weight_decay"]:
             print(f"\n--- Training with lr={lr}, weight_decay={wd} ---")
-            best_trial_val_loss = train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, wd, num_epochs, save_results=False)
+            best_trial_val_loss = train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, wd, num_epochs, weights, save_results=False)
             print(f"Final Val Loss for lr={lr}, wd={wd}: {best_trial_val_loss:.4f}")
             results.append({"lr": lr, "weight_decay": wd, "val_loss": best_trial_val_loss})
 
@@ -382,7 +442,39 @@ def grid_search(model_type, search_space, train_loader, val_loader, num_training
     plt.savefig(heatmap_path)
     print(f"Saved heatmap to {heatmap_path}")
 
-def test(model_type, test_path, model_load_path):
+def loss_function_search(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, num_epochs, lr, weight_decay):
+    timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    best_val_loss = float("inf")
+    best_weight_option = None
+    results = []
+
+    for i in range(len(WEIGHT_OPTIONS)):
+        weights = WEIGHT_OPTIONS[i]
+        print(f"\n--- Training with weights={weights} ---")
+        best_trial_val_loss = train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, weight_decay, num_epochs, weights, save_results=False)
+        print(f"Final val loss for weight option {i}: {best_trial_val_loss:.4f}")
+        results.append({"weight_option": i, "val_loss": best_trial_val_loss})
+
+        if best_trial_val_loss < best_val_loss:
+            best_val_loss = best_trial_val_loss
+            best_weight_option = i
+    
+    print(f"Best weight option: {best_weight_option}")
+
+    save_results_path = f"loss_function_search/results_{model_type}_{timestamp}"
+    os.makedirs(save_results_path, exist_ok=True)
+
+    # === Save results to txt file ===
+    results_txt_path = os.path.join(save_results_path, "loss_function_search_results.txt")
+    with open(results_txt_path, "w") as f:
+        f.write("Loss Function Search Results:\n")
+        for result in results:
+            f.write(f"weight_option: {result['weight_option']}, val_loss: {result['val_loss']:.4f}\n")
+        f.write(f"\nBest weight option: {best_weight_option}\n")
+        f.write(f"Best Validation Loss: {best_val_loss:.4f}\n")
+    print(f"Saved loss function search results to {results_txt_path}")
+
+def test(model_type, test_path, model_load_path, weights):
     test_paths = sorted(glob(test_path))
     test_loader = DataLoader(WildfireTFRecordDataset(test_paths), batch_size=BATCH_SIZE)
 
@@ -394,9 +486,9 @@ def test(model_type, test_path, model_load_path):
     model.load_state_dict(torch.load(f"{model_load_path}/{model_type}.pth", map_location=DEVICE))
     model.eval()
 
-    print(f"Loaded model from {model_load_path}. Beginning testing on {num_testing_batches} batches...")
+    print(f"Loaded model from {model_load_path}. Beginning testing on {num_testing_batches} batches with loss function weights {weights}...")
 
-    criterion = nn.CrossEntropyLoss(ignore_index=255)
+    criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=255)
     total_loss = 0.0
     batch_count = 0
 
@@ -472,39 +564,40 @@ def test(model_type, test_path, model_load_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or test wildfire segmentation model.")
-    parser.add_argument("mode", choices=["train", "test", "search"], help="Mode: train, test, or search")
-    parser.add_argument("--model_type", type=str, required=False, help="UNet or SegFormer", default="UNet")
+    parser.add_argument("mode", choices=["train", "test", "search", "loss"], help="Mode: train, test, search, or loss")
+    parser.add_argument("--model_type", type=str, required=False, help="UNet, SegFormerB0, or SegFormerB1", default="UNet")
     parser.add_argument("--model_path", type=str, required=False, help="Path to load model weights")
     parser.add_argument("--lr", type=float, required=False, help="Learning rate", default=1e-3)
     parser.add_argument("--wd", type=float, required=False, help="Weight decay", default=1e-2)
     parser.add_argument("--epochs", type=int, required=False, help="Number of epochs", default=30)
+    parser.add_argument("--weights", type=int, required=False, help="Weight option: 0 (inverse class counts), 1 (0.1, 0.9), 1 (0.25, 0.75), or 3 (0.5, 0.5)", default=1)
     parser.add_argument("--max_train_batches", type=int, required=False, help="Maximum number of training batches", default=100000)
     parser.add_argument("--max_val_batches", type=int, required=False, help="Maximum number of validation batches", default=100000)
     args = parser.parse_args()
 
-    print(f"Using device: {DEVICE}")
+    weights = WEIGHT_OPTIONS[args.weights]
 
-    if args.mode == "train" or args.mode == "search":
+    if args.mode == "train" or args.mode == "search" or args.mode == "loss":
         train_path = "archive/next_day_wildfire_spread_train_*.tfrecord"
         val_path = "archive/next_day_wildfire_spread_eval_*.tfrecord"
         train_loader, val_loader, num_training_batches, num_validation_batches = get_data(train_path, val_path, args.max_train_batches, args.max_val_batches)
         print(f"Training on {num_training_batches} batches, validating on {num_validation_batches} batches, batch size {BATCH_SIZE}")
 
         if args.mode == "train":
-            if args.lr is None or args.wd is None:
-                parser.error("--lr and --wd are required when mode is 'train'")
-            
-            print(f"{args.model_type} model will be trained for {args.epochs} epochs with learning rate {args.lr} and weight decay {args.wd}")
+            print(f"{args.model_type} model will be trained for {args.epochs} epochs with learning rate {args.lr}, weight decay {args.wd}, and loss function weights {weights}")
             print("\n--------------------------------------------------------------------\n")
-            train(args.model_type, train_loader, val_loader, num_training_batches, num_validation_batches, args.lr, args.wd, args.epochs)
+            train(args.model_type, train_loader, val_loader, num_training_batches, num_validation_batches, args.lr, args.wd, args.epochs, weights)
         elif args.mode == "search":
             search_space = {
                 "lr": [1e-4, 1e-3, 1e-2],
                 "weight_decay": [1e-5, 1e-3, 1e-2]
             }
 
-            print(f"Starting grid search with {args.model_type} model and hyperparameter space: {search_space}")
-            grid_search(args.model_type, search_space, train_loader, val_loader, num_training_batches, num_validation_batches, args.epochs)
+            print(f"Starting grid search with {args.model_type} model, {args.epochs} epochs, loss function weights {weights}, and hyperparameter space: {search_space}")
+            grid_search(args.model_type, search_space, train_loader, val_loader, num_training_batches, num_validation_batches, args.epochs, weights)
+        elif args.mode == "loss":
+            loss_function_search(args.model_type, train_loader, val_loader, num_training_batches, num_validation_batches, args.epochs, args.lr, args.wd)
+            
     elif args.mode == "test":
         test_path = "archive/next_day_wildfire_spread_test_*.tfrecord"
-        test(args.model_type, test_path, model_load_path=args.model_path)
+        test(args.model_type, test_path, args.model_path, weights)
