@@ -509,6 +509,7 @@ def loss_function_search(model_type, train_loader, val_loader, num_training_batc
         print(f"\n--- Training with weights={weights} ---")
         model, _ = train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, weight_decay, num_epochs, weights, save_results=False)
         val_loss, auc_pr, precision, recall, f1_score = get_statistics(model, val_loader, weights)
+        print(f"Final Val Loss: {val_loss:.4f}, AUC (PR): {auc_pr:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1_score:.4f}")
         results.append({"weight_option": i, "val_loss": val_loss, "auc_pr": auc_pr, "precision": precision, "recall": recall, "f1_score": f1_score})
 
         if auc_pr > best_auc_pr:
