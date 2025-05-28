@@ -389,9 +389,9 @@ def train(model_type, train_loader, val_loader, num_training_batches, num_valida
         plt.savefig(training_loss_plot_path)
         print(f"Saved loss plot to {training_loss_plot_path}")
     else:
-        return best_val_loss
+        return model, best_val_loss
     
-    return None
+    return None, None
 
 def grid_search(model_type, search_space, train_loader, val_loader, num_training_batches, num_validation_batches, num_epochs, weights):
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
@@ -402,7 +402,7 @@ def grid_search(model_type, search_space, train_loader, val_loader, num_training
     for lr in search_space["lr"]:
         for wd in search_space["weight_decay"]:
             print(f"\n--- Training with lr={lr}, weight_decay={wd} ---")
-            best_trial_val_loss = train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, wd, num_epochs, weights, save_results=False)
+            _, best_trial_val_loss = train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, wd, num_epochs, weights, save_results=False)
             print(f"Final Val Loss for lr={lr}, wd={wd}: {best_trial_val_loss:.4f}")
             results.append({"lr": lr, "weight_decay": wd, "val_loss": best_trial_val_loss})
 
@@ -442,61 +442,16 @@ def grid_search(model_type, search_space, train_loader, val_loader, num_training
     plt.savefig(heatmap_path)
     print(f"Saved heatmap to {heatmap_path}")
 
-def loss_function_search(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, num_epochs, lr, weight_decay):
-    timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-    best_val_loss = float("inf")
-    best_weight_option = None
-    results = []
-
-    for i in range(len(WEIGHT_OPTIONS)):
-        weights = WEIGHT_OPTIONS[i]
-        print(f"\n--- Training with weights={weights} ---")
-        best_trial_val_loss = train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, weight_decay, num_epochs, weights, save_results=False)
-        print(f"Final val loss for weight option {i}: {best_trial_val_loss:.4f}")
-        results.append({"weight_option": i, "val_loss": best_trial_val_loss})
-
-        if best_trial_val_loss < best_val_loss:
-            best_val_loss = best_trial_val_loss
-            best_weight_option = i
-    
-    print(f"Best weight option: {best_weight_option}")
-
-    save_results_path = f"loss_function_search/results_{model_type}_{timestamp}"
-    os.makedirs(save_results_path, exist_ok=True)
-
-    # === Save results to txt file ===
-    results_txt_path = os.path.join(save_results_path, "loss_function_search_results.txt")
-    with open(results_txt_path, "w") as f:
-        f.write("Loss Function Search Results:\n")
-        for result in results:
-            f.write(f"weight_option: {result['weight_option']}, val_loss: {result['val_loss']:.4f}\n")
-        f.write(f"\nBest weight option: {best_weight_option}\n")
-        f.write(f"Best Validation Loss: {best_val_loss:.4f}\n")
-    print(f"Saved loss function search results to {results_txt_path}")
-
-def test(model_type, test_path, model_load_path, weights):
-    test_paths = sorted(glob(test_path))
-    test_loader = DataLoader(WildfireTFRecordDataset(test_paths), batch_size=BATCH_SIZE)
-
-    num_testing_batches = 0
-    for batch in test_loader:
-         num_testing_batches += 1
-
-    model = get_model(model_type)
-    model.load_state_dict(torch.load(f"{model_load_path}/{model_type}.pth", map_location=DEVICE))
+def get_statistics(model, loader, weights):
     model.eval()
-
-    print(f"Loaded model from {model_load_path}. Beginning testing on {num_testing_batches} batches with loss function weights {weights}...")
-
-    criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=255)
     total_loss = 0.0
     batch_count = 0
-
     all_preds = []
     all_labels = []
+    criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=255)
 
     with torch.no_grad():
-        for x, y in test_loader:
+        for x, y in loader:
             x, y = x.to(DEVICE), y.to(DEVICE)  # y: (B, H, W)
             logits = model(x)  # (B, C, H, W)
             loss = criterion(logits, y)
@@ -520,8 +475,7 @@ def test(model_type, test_path, model_load_path, weights):
     # Convert to NumPy arrays
     all_labels = np.array(all_labels)
     all_preds = np.array(all_preds)
-    threshold = 0.5
-    pred_binary = (all_preds >= threshold).astype(int)
+    pred_binary = (all_preds >= 0.5).astype(int)
 
     test_loss_avg = total_loss / batch_count
     auc_pr = average_precision_score(all_labels, all_preds)
@@ -542,6 +496,54 @@ def test(model_type, test_path, model_load_path, weights):
     # best_threshold = thresholds[best_idx]
     # best_f1 = f1_scores[best_idx]
 
+    return (test_loss_avg, auc_pr, precision, recall, f1_score)
+
+def loss_function_search(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, num_epochs, lr, weight_decay):
+    timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    best_auc_pr = float("-inf")
+    best_weight_option = None
+    results = []
+
+    for i in range(len(WEIGHT_OPTIONS)):
+        weights = WEIGHT_OPTIONS[i]
+        print(f"\n--- Training with weights={weights} ---")
+        model, _ = train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, weight_decay, num_epochs, weights, save_results=False)
+        val_loss, auc_pr, precision, recall, f1_score = get_statistics(model, val_loader, weights)
+        results.append({"weight_option": i, "val_loss": val_loss, "auc_pr": auc_pr, "precision": precision, "recall": recall, "f1_score": f1_score})
+
+        if auc_pr > best_auc_pr:
+            best_auc_pr = auc_pr
+            best_weight_option = i
+    
+    print(f"Best weight option: {best_weight_option}")
+
+    save_results_path = f"loss_function_search/results_{model_type}_{timestamp}"
+    os.makedirs(save_results_path, exist_ok=True)
+
+    # === Save results to txt file ===
+    results_txt_path = os.path.join(save_results_path, "loss_function_search_results.txt")
+    with open(results_txt_path, "w") as f:
+        f.write("Loss Function Search Results:\n")
+        for result in results:
+            f.write(f"weight_option: {result['weight_option']}, val_loss: {result['val_loss']:.4f}, auc_pr: {result['auc_pr']:.4f}, precision: {result['precision']:.4f}, recall: {result['recall']:.4f}, f1_score: {result['f1_score']:.4f}\n")
+        f.write(f"\nBest weight option: {best_weight_option}\n")
+        f.write(f"Best AUC (PR): {best_auc_pr:.4f}\n")
+    print(f"Saved loss function search results to {results_txt_path}")
+
+def test(model_type, test_path, model_load_path, weights):
+    test_paths = sorted(glob(test_path))
+    test_loader = DataLoader(WildfireTFRecordDataset(test_paths), batch_size=BATCH_SIZE)
+
+    num_testing_batches = 0
+    for batch in test_loader:
+         num_testing_batches += 1
+
+    model = get_model(model_type)
+    model.load_state_dict(torch.load(f"{model_load_path}/{model_type}.pth", map_location=DEVICE))
+    print(f"Loaded model from {model_load_path}. Beginning testing on {num_testing_batches} batches with loss function weights {weights}...")
+
+    test_loss_avg, auc_pr, precision, recall, f1_score = get_statistics(model, test_loader, weights)
+    
     print(f"\nTest Loss: {test_loss_avg:.4f}")
     print(f"AUC (PR):   {auc_pr:.4f}")
     # print(f"Best threshold: {best_threshold:.4f}")
