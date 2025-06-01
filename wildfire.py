@@ -6,6 +6,7 @@ import numpy as np
 from glob import glob
 import itertools
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
 import argparse
 from datetime import datetime
 
@@ -21,6 +22,22 @@ target_key = 'FireMask'
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # display n sample
+DISPLAY_ORDER = ['erc', 'sph', 'pr', 'tmmn', 'tmmx', 'NDVI', 'pdsi', 'vs', 'th', 'population', 'elevation', 'PrevFireMask', 'FireMask']
+COL_TO_NAME_DICT = {
+    'erc' : 'Energy Release Component', 
+    'sph' : 'Specific Humidity', 
+    'pr' : 'Precipitation Amount', 
+    'tmmn' : 'Temperature Minimum', 
+    'tmmx' : 'Temperature Maximum', 
+    'NDVI' : 'Vegetation Index', 
+    'pdsi' : 'Drought Severity Index', 
+    'vs' : 'Wind Speed', 
+    'th' : 'Wind Direction', 
+    'population' : 'Population Density', 
+    'elevation' : 'Elevation', 
+    'PrevFireMask' : 'Fire Mask', 
+    'FireMask' : 'Next Day Fire Mask'
+}
 def display_tfrecord(tfrecord_path, n=1):
     loader = tfrecord_loader(tfrecord_path, index_path=None)
     for i, record in enumerate(itertools.islice(loader, n), 1):
@@ -31,11 +48,18 @@ def display_tfrecord(tfrecord_path, n=1):
         cols = int(np.ceil(num_keys / rows))
         fig, axes = plt.subplots(rows, cols, figsize=(15, 3))
 
-        for ax, (key, value) in zip(axes.flat, sorted(record.items())):
+        for ax, key in zip(axes.flat, DISPLAY_ORDER):
             try:
+                value = record[key]
                 arr = np.array(value, dtype=np.float32).reshape(IMG_SHAPE)
-                ax.imshow(arr, cmap='viridis')
-                ax.set_title(key)
+                if 'FireMask' in key :
+                    firemask_cmap = ListedColormap(['dimgray', 'lightgray', 'red'])
+                    firemask_norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], firemask_cmap.N)
+                    ax.imshow(arr, cmap=firemask_cmap, norm=firemask_norm)
+                else :
+                    ax.imshow(arr, cmap='viridis')
+
+                ax.set_title(COL_TO_NAME_DICT[key].replace(' ', '\n'), fontsize=9)
                 ax.axis('off')
             except Exception as e:
                 ax.set_title(f"{key} (Error)")
