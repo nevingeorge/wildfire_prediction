@@ -1,0 +1,14 @@
+Grid Search Results:
+lr: 0.0001, weight_decay: 1e-05, val_loss: 0.0399
+lr: 0.0001, weight_decay: 0.001, val_loss: 0.0400
+lr: 0.0001, weight_decay: 0.01, val_loss: 0.0413
+lr: 0.001, weight_decay: 1e-05, val_loss: 0.0413
+lr: 0.001, weight_decay: 0.001, val_loss: 0.0408
+lr: 0.001, weight_decay: 0.01, val_loss: 0.0405
+lr: 0.01, weight_decay: 1e-05, val_loss: 0.0416
+lr: 0.01, weight_decay: 0.001, val_loss: 0.0410
+lr: 0.01, weight_decay: 0.01, val_loss: 0.0406
+
+Best Hyperparameters:
+{'lr': 0.0001, 'weight_decay': 1e-05}
+Best Validation Loss: 0.0399

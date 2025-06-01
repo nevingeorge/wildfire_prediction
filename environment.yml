@@ -12,5 +12,9 @@ dependencies:
   - pillow
   - pytorch
   - torchvision
+  - scikit-learn
+  - seaborn
+  - cpuonly
   - pip:
       - tfrecord
+      - transformers
