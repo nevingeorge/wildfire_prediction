@@ -17,6 +17,7 @@ from sklearn.metrics import precision_score, recall_score, average_precision_sco
 import seaborn as sns
 import pandas as pd
 from transformers import SegformerForSemanticSegmentation, SegformerConfig
+from tqdm import tqdm
 
 IMG_SHAPE = (64,64)
 NUM_CLASSES = 2  # fire vs no-fire (uncertain is ignored)
@@ -95,19 +96,128 @@ def display_tfrecord(tfrecord_path, n=1):
         plt.tight_layout()
         plt.show()
 
+def display_tensor_record(x) :
+    """
+    Display each of the 12 input channels in a tensor like display_tfrecord.
+    
+    Args:
+        x: Tensor of shape (1, 12, H, W)
+    """
+    x = x.squeeze(0).cpu().numpy()  # Shape: (12, H, W)
+
+    input_keys = DISPLAY_ORDER[:-2]  # Remove PrevFireMask and FireMask
+    rows = 1
+    cols = len(input_keys)
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 3))
+
+    for ax, key in zip(axes.flat, input_keys):
+        idx = DISPLAY_ORDER.index(key)
+        try:
+            ax.imshow(x[idx], cmap='viridis')
+            ax.set_title(COL_TO_NAME_DICT[key].replace(' ', '\n'), fontsize=9)
+            ax.axis('off')
+        except Exception as e:
+            ax.set_title(f"{key} (Error)")
+            ax.text(0.5, 0.5, str(e), ha='center', va='center')
+            ax.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+def display_saliency_map(saliency, collapsed=False):
+    """
+    Display saliency maps in the same layout as display_tfrecord.
+    
+    Args:
+        saliency: Tensor or ndarray of shape (12, H, W)
+    """
+    if collapsed:
+        plt.figure(figsize=(6, 5))
+        plt.imshow(saliency, cmap='hot')
+        plt.colorbar()
+        plt.title('Saliency')
+        plt.axis('off')
+        plt.show()
+    else :
+        saliency = saliency.numpy() if isinstance(saliency, torch.Tensor) else saliency
+    
+        rows = 1
+        cols = len(DISPLAY_ORDER) - 2  # exclude PrevFireMask and FireMask
+        fig, axes = plt.subplots(rows, cols, figsize=(15, 3))
+    
+        for ax, key in zip(axes.flat, DISPLAY_ORDER[:-2]):  # skip FireMask/PrevFireMask
+            idx = DISPLAY_ORDER.index(key)
+            try:
+                ax.imshow(saliency[idx], cmap='hot')
+                ax.set_title(COL_TO_NAME_DICT[key].replace(' ', '\n'), fontsize=9)
+                ax.axis('off')
+            except Exception as e:
+                ax.set_title(f"{key} (Error)")
+                ax.text(0.5, 0.5, str(e), ha='center', va='center')
+                ax.axis('off')
+    
+        plt.tight_layout()
+        plt.show()
+
+def smoothgrad(model, x, target_class=1, n_samples=50, noise_std=0.1, collapse=False):
+    """
+    Compute SmoothGrad saliency map.
+
+    Args:
+        model: PyTorch model
+        x: Input tensor of shape (1, 12, H, W)
+        target_class: class index to compute gradient with respect to
+        n_samples: number of noisy samples
+        noise_std: std of Gaussian noise added to input
+
+    Returns:
+        SmoothGrad saliency map of shape (H, W)
+    """
+    model.eval()
+    x = x.clone().detach().to(DEVICE).requires_grad_(True)
+
+    _, _, H, W = x.shape
+    grads = torch.zeros_like(x).to(DEVICE)
+
+    for i in range(n_samples):
+        noise = torch.randn_like(x) * noise_std
+        x_noisy = (x + noise).clamp(0, 1)
+        x_noisy.requires_grad_()
+        x_noisy.retain_grad()
+
+        output = model(x_noisy)  # (1, C, H, W)
+        score = output[0, target_class].mean()
+        model.zero_grad()
+        score.backward()
+
+        grads += x_noisy.grad.data
+
+    grads /= n_samples
+    if collapse:
+        saliency = grads.abs().sum(dim=1).squeeze().cpu().numpy()  # shape (H, W)
+    else :
+        saliency = grads.abs().squeeze().cpu().numpy()  # shape (C, H, W)
+
+    return saliency
+
 # === Dataset ===
 class WildfireTFRecordDataset(IterableDataset):
     def __init__(self, tfrecord_paths):
         self.paths = tfrecord_paths
+        self.input_keys = DISPLAY_ORDER[:-1]
+        self.target_key = target_key
 
     def __iter__(self):
         for path in self.paths:
             for record in tfrecord_loader(path, index_path=None):
                 try:
-                    input_images = [
-                        np.array(record[k], dtype=np.float32).reshape(IMG_SHAPE)
-                        for k in input_keys
-                    ]
+                    input_images = []
+                    for key in self.input_keys:
+                        if key not in record:
+                            raise ValueError(f"Missing key: {key}")
+                        arr = np.array(record[key], dtype=np.float32).reshape(IMG_SHAPE)
+                        input_images.append(arr)
+
                     x = np.stack(input_images, axis=0)  # (12, 64, 64)
 
                     y = np.array(record[target_key], dtype=np.uint8).reshape(IMG_SHAPE)
@@ -466,7 +576,7 @@ def grid_search(model_type, search_space, train_loader, val_loader, num_training
     plt.savefig(heatmap_path)
     print(f"Saved heatmap to {heatmap_path}")
 
-def get_statistics(model, loader, weights):
+def get_statistics(model, loader, weights, maxsamples=None):
     model.eval()
     total_loss = 0.0
     batch_count = 0
@@ -475,7 +585,13 @@ def get_statistics(model, loader, weights):
     criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=255)
 
     with torch.no_grad():
-        for x, y in loader:
+        if maxsamples is not None:
+            iterator = enumerate(tqdm(loader, desc="Evaluating", unit="batch", total=maxsamples))
+        else:
+            iterator = enumerate(tqdm(loader, desc="Evaluating", unit="batch"))
+        for batch_idx, (x, y) in iterator:
+            if maxsamples is not None and batch_idx >= maxsamples:
+                break
             x, y = x.to(DEVICE), y.to(DEVICE)  # y: (B, H, W)
             logits = model(x)  # (B, C, H, W)
             loss = criterion(logits, y)
