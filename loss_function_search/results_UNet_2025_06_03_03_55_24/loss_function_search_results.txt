@@ -1,0 +1,8 @@
+Loss Function Search Results:
+weight_option: 0, val_loss: 0.5314, auc_pr: 0.1759, precision: 0.0739, recall: 0.6090, f1_score: 0.1317
+weight_option: 1, val_loss: 0.2717, auc_pr: 0.1514, precision: 0.2901, recall: 0.2037, f1_score: 0.2394
+weight_option: 2, val_loss: 0.1352, auc_pr: 0.1713, precision: 0.5467, recall: 0.0558, f1_score: 0.1013
+weight_option: 3, val_loss: 0.0585, auc_pr: 0.1277, precision: 0.0000, recall: 0.0000, f1_score: 0.0000
+
+Best weight option: 0
+Best AUC (PR): 0.1759
