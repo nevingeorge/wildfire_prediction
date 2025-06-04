@@ -757,5 +757,5 @@ if __name__ == "__main__":
         print(f"Starting threshold search for model at {args.model_path} with loss function weights {weights}")
         threshold_search(args.model_type, val_path, args.model_path, weights)
     elif args.mode == "test":
-        print(f"Starting test for model at {args.model_path} with loss function weights {weights}")
+        print(f"Starting test for model at {args.model_path} with loss function weights {weights} and threshold {args.threshold}")
         test(args.model_type, test_path, args.model_path, weights, args.threshold)
