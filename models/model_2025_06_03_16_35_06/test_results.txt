@@ -1,0 +1,5 @@
+Test Loss: 0.1152
+AUC (PR):   0.1772
+F1 score: 0.2584
+Precision: 0.2271
+Recall:    0.2998
