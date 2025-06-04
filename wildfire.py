@@ -576,7 +576,7 @@ def grid_search(model_type, search_space, train_loader, val_loader, num_training
     plt.savefig(heatmap_path)
     print(f"Saved heatmap to {heatmap_path}")
 
-def get_statistics(model, loader, weights, maxsamples=None):
+def get_predictions(model, loader, weights, maxsamples=None):
     model.eval()
     total_loss = 0.0
     batch_count = 0
@@ -615,26 +615,23 @@ def get_statistics(model, loader, weights, maxsamples=None):
     # Convert to NumPy arrays
     all_labels = np.array(all_labels)
     all_preds = np.array(all_preds)
-    pred_binary = (all_preds >= 0.5).astype(int)
+    loss_avg = total_loss / batch_count
+    return all_labels, all_preds, loss_avg
 
-    test_loss_avg = total_loss / batch_count
+def get_statistics(model, loader, weights, threshold=0.5, maxsamples=None):
+    all_labels, all_preds, test_loss_avg = get_predictions(model, loader, weights, maxsamples)
+
+    pred_binary = (all_preds >= threshold).astype(int)
     auc_pr = average_precision_score(all_labels, all_preds)
     precision = precision_score(all_labels, pred_binary)
     recall = recall_score(all_labels, pred_binary)
     f1_score = 2 * (precision * recall) / (precision + recall + 1e-8)
-
     # print("Max fire prob:", np.max(all_preds))
     # print("Mean fire prob:", np.mean(all_preds))
-
     # unique, counts = np.unique(all_labels, return_counts=True)
     # print(dict(zip(unique, counts)))
 
-    # precision, recall, thresholds = precision_recall_curve(all_labels, all_preds)
-    # f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
-
-    # best_idx = np.argmax(f1_scores)
-    # best_threshold = thresholds[best_idx]
-    # best_f1 = f1_scores[best_idx]
+    print(f"Loss: {test_loss_avg:.4f}, AUC (PR): {auc_pr:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1_score:.4f}")
 
     return (test_loss_avg, auc_pr, precision, recall, f1_score)
 
@@ -649,7 +646,6 @@ def loss_function_search(model_type, train_loader, val_loader, num_training_batc
         print(f"\n--- Training with weights={weights} ---")
         model, _ = train(model_type, train_loader, val_loader, num_training_batches, num_validation_batches, lr, weight_decay, num_epochs, weights, save_results=False)
         val_loss, auc_pr, precision, recall, f1_score = get_statistics(model, val_loader, weights)
-        print(f"Final Val Loss: {val_loss:.4f}, AUC (PR): {auc_pr:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1_score:.4f}")
         results.append({"weight_option": i, "val_loss": val_loss, "auc_pr": auc_pr, "precision": precision, "recall": recall, "f1_score": f1_score})
 
         if auc_pr > best_auc_pr:
@@ -671,29 +667,41 @@ def loss_function_search(model_type, train_loader, val_loader, num_training_batc
         f.write(f"Best AUC (PR): {best_auc_pr:.4f}\n")
     print(f"Saved loss function search results to {results_txt_path}")
 
-def test(model_type, test_path, model_load_path, weights):
-    test_paths = sorted(glob(test_path))
-    test_loader = DataLoader(WildfireTFRecordDataset(test_paths), batch_size=BATCH_SIZE)
+def get_loader_model(model_type, path, model_load_path, weights):
+    paths = sorted(glob(path))
+    loader = DataLoader(WildfireTFRecordDataset(paths), batch_size=BATCH_SIZE)
 
-    num_testing_batches = 0
-    for batch in test_loader:
-         num_testing_batches += 1
+    num_batches = 0
+    for batch in loader:
+         num_batches += 1
 
     model = get_model(model_type)
     model.load_state_dict(torch.load(f"{model_load_path}/{model_type}.pth", map_location=DEVICE))
-    print(f"Loaded model from {model_load_path}. Beginning testing on {num_testing_batches} batches with loss function weights {weights}...")
+    print(f"Loaded model from {model_load_path}. Beginning testing on {num_batches} batches with loss function weights {weights}...")
+    return loader, model
 
-    test_loss_avg, auc_pr, precision, recall, f1_score = get_statistics(model, test_loader, weights)
+def threshold_search(model_type, val_path, model_load_path, weights):
+    val_loader, model = get_loader_model(model_type, val_path, model_load_path, weights)
+    all_labels, all_preds, _ = get_predictions(model, val_loader, weights)
     
-    print(f"\nTest Loss: {test_loss_avg:.4f}")
-    print(f"AUC (PR):   {auc_pr:.4f}")
-    # print(f"Best threshold: {best_threshold:.4f}")
-    # print(f"F1 score: {best_f1:.4f}")
-    # print(f"Precision: {precision[best_idx]:.4f}")
-    # print(f"Recall: {recall[best_idx]:.4f}")
-    print(f"F1 score: {f1_score:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
+    save_results_path = f"{model_load_path}/threshold_search_results.txt"
+    with open(save_results_path, "w") as f:
+        precision, recall, thresholds = precision_recall_curve(all_labels, all_preds)
+        f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)  # Add epsilon to avoid divide-by-zero
+
+        best_index = np.argmax(f1_scores)
+        best_threshold = thresholds[best_index]
+        best_f1 = f1_scores[best_index]
+
+        print(f"Best threshold: {best_threshold:.4f}")
+        print(f"Best F1 score: {best_f1:.4f}")
+        f.write(f"\nBest Threshold: {best_threshold:.4f}, Best F1 score: {best_f1:.4f}\n")
+    print(f"Results saved to {save_results_path}")
+
+def test(model_type, test_path, model_load_path, weights, threshold=0.5):
+    test_loader, model = get_loader_model(model_type, test_path, model_load_path, weights)
+
+    test_loss_avg, auc_pr, precision, recall, f1_score = get_statistics(model, test_loader, weights, threshold)
 
     save_results_path = f"{model_load_path}/test_results.txt"
     with open(save_results_path, "w") as f:
@@ -707,27 +715,31 @@ def test(model_type, test_path, model_load_path, weights):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or test wildfire segmentation model.")
-    parser.add_argument("mode", choices=["train", "test", "search", "loss"], help="Mode: train, test, search, or loss")
+    parser.add_argument("mode", choices=["train", "test", "search", "loss", "threshold"], help="Mode: train, test, search, loss, or threshold")
     parser.add_argument("--model_type", type=str, required=False, help="UNet, SegFormerB0, or SegFormerB1", default="UNet")
     parser.add_argument("--model_path", type=str, required=False, help="Path to load model weights")
     parser.add_argument("--lr", type=float, required=False, help="Learning rate", default=1e-3)
     parser.add_argument("--wd", type=float, required=False, help="Weight decay", default=1e-2)
     parser.add_argument("--epochs", type=int, required=False, help="Number of epochs", default=30)
     parser.add_argument("--weights", type=int, required=False, help="Weight option: 0 (inverse class counts), 1 (0.1, 0.9), 2 (0.25, 0.75), or 3 (0.5, 0.5)", default=3)
+    parser.add_argument("--threshold", type=float, required=False, help="Threshold", default=0.5)
     parser.add_argument("--max_train_batches", type=int, required=False, help="Maximum number of training batches", default=100000)
     parser.add_argument("--max_val_batches", type=int, required=False, help="Maximum number of validation batches", default=100000)
     args = parser.parse_args()
 
     weights = WEIGHT_OPTIONS[args.weights]
 
+    train_path = "archive/next_day_wildfire_spread_train_*.tfrecord"
+    val_path = "archive/next_day_wildfire_spread_eval_*.tfrecord"
+    test_path = "archive/next_day_wildfire_spread_test_*.tfrecord"
+    print(f"Model selection: {args.model_type}\n")
+
     if args.mode == "train" or args.mode == "search" or args.mode == "loss":
-        train_path = "archive/next_day_wildfire_spread_train_*.tfrecord"
-        val_path = "archive/next_day_wildfire_spread_eval_*.tfrecord"
         train_loader, val_loader, num_training_batches, num_validation_batches = get_data(train_path, val_path, args.max_train_batches, args.max_val_batches)
         print(f"Training on {num_training_batches} batches, validating on {num_validation_batches} batches, batch size {BATCH_SIZE}")
 
         if args.mode == "train":
-            print(f"{args.model_type} model will be trained for {args.epochs} epochs with learning rate {args.lr}, weight decay {args.wd}, and loss function weights {weights}")
+            print(f"Model will be trained for {args.epochs} epochs with learning rate {args.lr}, weight decay {args.wd}, and loss function weights {weights}")
             print("\n--------------------------------------------------------------------\n")
             train(args.model_type, train_loader, val_loader, num_training_batches, num_validation_batches, args.lr, args.wd, args.epochs, weights)
         elif args.mode == "search":
@@ -736,12 +748,14 @@ if __name__ == "__main__":
                 "weight_decay": [1e-5, 1e-3, 1e-2]
             }
 
-            print(f"Starting grid search with {args.model_type} model, {args.epochs} epochs, loss function weights {weights}, and hyperparameter space: {search_space}")
+            print(f"Starting grid search with {args.epochs} epochs, loss function weights {weights}, and hyperparameter space: {search_space}")
             grid_search(args.model_type, search_space, train_loader, val_loader, num_training_batches, num_validation_batches, args.epochs, weights)
         elif args.mode == "loss":
-            print(f"Starting loss function search with {args.model_type} model, {args.epochs} epochs, learning rate {args.lr}, and weight decay {args.wd}")
+            print(f"Starting loss function search with {args.epochs} epochs, learning rate {args.lr}, and weight decay {args.wd}")
             loss_function_search(args.model_type, train_loader, val_loader, num_training_batches, num_validation_batches, args.epochs, args.lr, args.wd)
-            
+    elif args.mode == "threshold":
+        print(f"Starting threshold search for model at {args.model_path} with loss function weights {weights}")
+        threshold_search(args.model_type, val_path, args.model_path, weights)
     elif args.mode == "test":
-        test_path = "archive/next_day_wildfire_spread_test_*.tfrecord"
-        test(args.model_type, test_path, args.model_path, weights)
+        print(f"Starting test for model at {args.model_path} with loss function weights {weights}")
+        test(args.model_type, test_path, args.model_path, weights, args.threshold)
