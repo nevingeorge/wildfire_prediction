@@ -96,24 +96,32 @@ def display_tfrecord(tfrecord_path, n=1):
         plt.tight_layout()
         plt.show()
 
-def display_tensor_record(x) :
+def display_tensor_record(x, include_mask=True):
     """
     Display each of the 12 input channels in a tensor like display_tfrecord.
     
     Args:
-        x: Tensor of shape (1, 12, H, W)
+        x: Tensor of shape (1, 12, H, W) or (1, 13, H, W) if include_mask=True
+        include_mask: If True, visualize channel 12 as the next-day fire mask
     """
-    x = x.squeeze(0).cpu().numpy()  # Shape: (12, H, W)
+    x = x.squeeze(0).cpu().numpy()  # Shape: (12, H, W) or (13, H, W)
+    num_channels = x.shape[0]
 
-    input_keys = DISPLAY_ORDER[:-2]  # Remove PrevFireMask and FireMask
+    input_keys = DISPLAY_ORDER[:-1] if include_mask else DISPLAY_ORDER[:-2]  # drop FireMask optionally
     rows = 1
     cols = len(input_keys)
     fig, axes = plt.subplots(rows, cols, figsize=(15, 3))
 
-    for ax, key in zip(axes.flat, input_keys):
-        idx = DISPLAY_ORDER.index(key)
+    firemask_cmap = ListedColormap(['dimgray', 'lightgray', 'red'])
+    firemask_norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], firemask_cmap.N)
+
+    for ax, key, channel_index in zip(axes.flat, input_keys, range(len(input_keys))):
         try:
-            ax.imshow(x[idx], cmap='viridis')
+            arr = x[channel_index]
+            if 'FireMask' in key:
+                ax.imshow(arr, cmap=firemask_cmap, norm=firemask_norm)
+            else:
+                ax.imshow(arr, cmap='viridis')
             ax.set_title(COL_TO_NAME_DICT[key].replace(' ', '\n'), fontsize=9)
             ax.axis('off')
         except Exception as e:
@@ -124,81 +132,218 @@ def display_tensor_record(x) :
     plt.tight_layout()
     plt.show()
 
-def display_saliency_map(saliency, collapsed=False):
-    """
-    Display saliency maps in the same layout as display_tfrecord.
-    
-    Args:
-        saliency: Tensor or ndarray of shape (12, H, W)
-    """
-    if collapsed:
-        plt.figure(figsize=(6, 5))
-        plt.imshow(saliency, cmap='hot')
-        plt.colorbar()
-        plt.title('Saliency')
+def get_model_pred(model, x, threshold=0.5):
+    x = x.to(DEVICE)
+    logits = model(x)
+    probs = torch.softmax(logits, dim=1)
+    pos_probs = probs[:, 1, :, :]
+    print(f"max prob: {pos_probs.max()}")
+    print(f"max prob in center: {pos_probs[..., 3:-3, 3:-3].max()}")
+    y_pred = (pos_probs >= threshold).long()
+    y_pred = y_pred.cpu().numpy()[0]
+
+    return y_pred
+
+def supress_border(pred, border_size=0):
+    if isinstance(pred, torch.Tensor):
+        sup_pred = pred.clone()
+    elif isinstance(pred, np.ndarray):
+        sup_pred = pred.copy()
+    else:
+        raise TypeError("Input must be a torch.Tensor or numpy.ndarray")
+        
+    sup_pred[..., :border_size, :] = 0
+    sup_pred[..., -border_size:, :] = 0
+    sup_pred[..., :, :border_size] = 0
+    sup_pred[..., :, -border_size:] = 0
+    return sup_pred
+
+def plot_pred(y_pred, y_true=None) :
+    firemask_cmap = ListedColormap(['dimgray', 'lightgray', 'red'])
+    firemask_norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], firemask_cmap.N)
+    if y_true is None:
+        plt.figure(figsize=(3,3))
+        plt.imshow(y_pred, cmap=firemask_cmap, norm=firemask_norm)
         plt.axis('off')
         plt.show()
     else :
-        saliency = saliency.numpy() if isinstance(saliency, torch.Tensor) else saliency
+        fig, axes = plt.subplots(1, 2, figsize=(3,6))
     
-        rows = 1
-        cols = len(DISPLAY_ORDER) - 2  # exclude PrevFireMask and FireMask
-        fig, axes = plt.subplots(rows, cols, figsize=(15, 3))
+        if len(y_true.shape) == 3:
+            y_true = y_true[0, :, :]
+        axes[0].imshow(y_true, cmap=firemask_cmap, norm=firemask_norm)
+        axes[0].set_title("Next Day\nFire Mask\n(Ground Truth)", fontsize=9)
+        axes[0].axis('off')
     
-        for ax, key in zip(axes.flat, DISPLAY_ORDER[:-2]):  # skip FireMask/PrevFireMask
-            idx = DISPLAY_ORDER.index(key)
-            try:
-                ax.imshow(saliency[idx], cmap='hot')
-                ax.set_title(COL_TO_NAME_DICT[key].replace(' ', '\n'), fontsize=9)
-                ax.axis('off')
-            except Exception as e:
-                ax.set_title(f"{key} (Error)")
-                ax.text(0.5, 0.5, str(e), ha='center', va='center')
-                ax.axis('off')
-    
+        axes[1].imshow(y_pred, cmap=firemask_cmap, norm=firemask_norm)
+        axes[1].set_title("Next Day\nFire Mask\n(Predicted)", fontsize=9)
+        axes[1].axis('off')
         plt.tight_layout()
         plt.show()
 
-def smoothgrad(model, x, target_class=1, n_samples=50, noise_std=0.1, collapse=False):
-    """
-    Compute SmoothGrad saliency map.
 
-    Args:
-        model: PyTorch model
-        x: Input tensor of shape (1, 12, H, W)
-        target_class: class index to compute gradient with respect to
-        n_samples: number of noisy samples
-        noise_std: std of Gaussian noise added to input
+#### Feature Analysis
+class GradCAM:
+    def __init__(self, model, target_layer, threshold=0.5, border_size=0):
+        self.model = model.eval()
+        self.target_layer = target_layer
+        self.threshold = threshold
+        self.target_class = 1
+        self.border_size = border_size
+        self.activations = None
+        self.gradients = None
+        self._register_hooks()
 
-    Returns:
-        SmoothGrad saliency map of shape (H, W)
-    """
-    model.eval()
-    x = x.clone().detach().to(DEVICE).requires_grad_(True)
+    def _register_hooks(self):
+        def forward_hook(module, input, output):
+            self.activations = output.detach()
+        def backward_hook(module, grad_in, grad_out):
+            self.gradients = grad_out[0].detach()
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_backward_hook(backward_hook)
 
-    _, _, H, W = x.shape
-    grads = torch.zeros_like(x).to(DEVICE)
-
-    for i in range(n_samples):
-        noise = torch.randn_like(x) * noise_std
-        x_noisy = (x + noise).clamp(0, 1)
-        x_noisy.requires_grad_()
-        x_noisy.retain_grad()
-
-        output = model(x_noisy)  # (1, C, H, W)
-        score = output[0, target_class].mean()
-        model.zero_grad()
+    def generate(self, x):
+        x = x.clone().detach().to(DEVICE).requires_grad_(True)
+        output = self.model(x)
+        probs = torch.softmax(output, dim=1)
+        positive_probs = probs[0, self.target_class]
+        positive_probs = supress_border(positive_probs, border_size=self.border_size)
+        mask = (positive_probs >= self.threshold).float()
+        score = (positive_probs * mask).sum() / (mask.sum() + 1e-6)
+        
+        self.model.zero_grad()
         score.backward()
 
-        grads += x_noisy.grad.data
+        weights = self.gradients.mean(dim=(2, 3), keepdim=True)
+        cam = (weights * self.activations).sum(dim=1)
+        cam = F.relu(cam)
+        cam = F.interpolate(cam.unsqueeze(1), size=x.shape[2:], mode='bilinear', align_corners=False)
+        cam = cam.squeeze().cpu().numpy()
 
-    grads /= n_samples
-    if collapse:
-        saliency = grads.abs().sum(dim=1).squeeze().cpu().numpy()  # shape (H, W)
-    else :
-        saliency = grads.abs().squeeze().cpu().numpy()  # shape (C, H, W)
+        cam = (cam - cam.min()) / (cam.max() + 1e-6)
+        return cam
 
-    return saliency
+    def display(self, cam) :
+        plt.figure(figsize=(3, 3))
+        plt.imshow(cam, cmap='hot')
+        plt.title("Grad-CAM Heatmap")
+        plt.axis('off')
+        plt.show()
+
+class SmoothGrad:
+    def __init__(self, model, noise_std=0.1, n_samples=50, collapse=False, threshold=0.5, border_size=0):
+        self.model = model
+        self.noise_std = noise_std
+        self.n_samples = n_samples
+        self.collapse = collapse
+        self.target_class = 1
+        self.threshold = threshold
+        self.border_size = border_size
+
+    def generate(self, x):
+        self.model.eval()
+        x = x.clone().detach().to(DEVICE).requires_grad_(True)
+    
+        B, C, H, W = x.shape
+        grads = torch.zeros_like(x).to(DEVICE)
+    
+        for i in range(self.n_samples):
+            channel_stds = x.std(dim=(0, 2, 3), keepdim=True)
+            channel_stds = channel_stds.clamp(min=0.1)
+            noise = torch.randn_like(x) * self.noise_std * channel_stds
+            x_reshaped = x.permute(1, 0, 2, 3).reshape(C, -1)
+            mins = x_reshaped.min(dim=1).values
+            maxs = x_reshaped.max(dim=1).values
+            epsilon = 0.05 * (maxs - mins + 0.1)
+            lowerbound = (mins - epsilon).view(1, -1, 1, 1)
+            upperbound = (maxs + epsilon).view(1, -1, 1, 1)
+            x_noisy = torch.max(torch.min(x + noise, upperbound), lowerbound)
+            
+            # display_tensor_record(x.detach() - x_noisy.detach()) # TODO REMOVE DEBUG STATEMENT
+            
+            x_noisy.requires_grad_()
+            x_noisy.retain_grad()
+    
+            output = self.model(x_noisy)  # (1, C, H, W)
+            probs = torch.softmax(output, dim=1)
+            positive_probs = probs[0, self.target_class]
+            positive_probs = supress_border(positive_probs, border_size=self.border_size)
+            mask = (positive_probs >= self.threshold).float()
+            score = (positive_probs * mask).sum() / (mask.sum() + 1e-6)
+            
+            self.model.zero_grad()
+            grad = torch.autograd.grad(score, x_noisy, retain_graph=True)[0]
+            grads += grad 
+    
+        grads /= self.n_samples
+        if self.collapse:
+            saliency = grads.abs().sum(dim=1).squeeze().cpu().numpy()  # shape (H, W)
+        else :
+            saliency = grads.abs().squeeze().cpu().numpy()  # shape (C, H, W)
+    
+        return saliency
+
+    def display(self, saliency):
+        if self.collapse:
+            plt.figure(figsize=(6, 5))
+            plt.imshow(saliency, cmap='hot')
+            plt.colorbar()
+            plt.title('Saliency')
+            plt.axis('off')
+            plt.show()
+        else :
+            saliency = saliency.numpy() if isinstance(saliency, torch.Tensor) else saliency
+            num_channels = saliency.shape[0]
+            display_keys = DISPLAY_ORDER[:num_channels]
+    
+            global_min = saliency.min()
+            global_max = saliency.max()
+            
+            rows = 1
+            cols = len(display_keys)
+            fig, axes = plt.subplots(rows, cols, figsize=(15, 3))
+    
+            firemask_cmap = ListedColormap(['dimgray', 'lightgray', 'red'])
+            firemask_norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], firemask_cmap.N)
+    
+            for ax, key, idx in zip(axes.flat, display_keys, range(num_channels)):
+                try:
+                    arr = saliency[idx]
+                    ax.imshow(arr, cmap='hot', vmin=global_min, vmax=global_max)
+                    ax.set_title(COL_TO_NAME_DICT[key].replace(' ', '\n'), fontsize=9)
+                    ax.axis('off')
+                except Exception as e:
+                    ax.set_title(f"{key} (Error)")
+                    ax.text(0.5, 0.5, str(e), ha='center', va='center')
+                    ax.axis('off')
+    
+            plt.tight_layout()
+            plt.show()
+
+class FeatureAnalyzer() :
+    def __init__(self, model, gradcam_layer=None, noise_std=0.1, n_samples=50, threshold=0.5, border_size=0, collapse=False):
+        self.model = model.to(DEVICE)
+        self.threshold = threshold
+        self.border_size = border_size
+        self.smoothgrad = SmoothGrad(model, noise_std=noise_std, n_samples=n_samples, collapse=collapse, threshold=threshold, border_size=border_size)
+        if gradcam_layer is not None:
+            self.gradcam = GradCAM(model, gradcam_layer, threshold=threshold, border_size=border_size)
+        else :
+            self.gradcam = None
+
+    def analyze(self, x, y=None) :
+        display_tensor_record(x, include_mask=True)
+
+        saliency = self.smoothgrad.generate(x)
+        self.smoothgrad.display(saliency)
+
+        if self.gradcam is not None:
+            cam = self.gradcam.generate(x)
+            self.gradcam.display(cam)
+
+        y_pred = get_model_pred(self.model, x, threshold=self.threshold)
+        y_pred = supress_border(y_pred, border_size=self.border_size)
+        plot_pred(y_pred, y_true=y)
 
 # === Dataset ===
 class WildfireTFRecordDataset(IterableDataset):
