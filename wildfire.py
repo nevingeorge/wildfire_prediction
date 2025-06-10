@@ -224,7 +224,7 @@ class GradCAM:
         return cam
 
     def display(self, cam) :
-        plt.figure(figsize=(3, 3))
+        plt.figure(figsize=(2, 2))
         plt.imshow(cam, cmap='hot')
         plt.title("Grad-CAM Heatmap")
         plt.axis('off')
